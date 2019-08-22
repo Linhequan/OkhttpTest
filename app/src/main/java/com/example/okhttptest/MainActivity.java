@@ -4,14 +4,18 @@ import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 
 import android.Manifest;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
@@ -19,12 +23,20 @@ import android.widget.ImageView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.example.okhttptest.Interceptor.CacheInterceptor;
+
 import java.io.File;
 import java.io.IOException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
+import okhttp3.Cache;
+import okhttp3.CacheControl;
 import okhttp3.Call;
 import okhttp3.Callback;
 import okhttp3.FormBody;
+import okhttp3.Interceptor;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -32,6 +44,8 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 
 public class MainActivity extends AppCompatActivity implements View.OnClickListener {
+    /**创建一个定时的线程池**/
+    private ScheduledExecutorService executor = Executors.newScheduledThreadPool(1);
     /**
      * get请求
      */
@@ -47,6 +61,8 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
     private Button btn_get_post;
     private TextView tv_result;
     private ImageView image;
+
+    private Cache cache;
 
     private Handler handler = new Handler(){
         @Override
@@ -72,6 +88,10 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
         tv_result = (TextView) findViewById(R.id.tv_result);
         image = (ImageView) findViewById(R.id.image);
         btn_get_post.setOnClickListener(this);
+        init();
+    }
+
+    public void init() {
         /**
          * 动态获取权限，Android 6.0 新特性，一些保护权限，除了要在AndroidManifest中声明权限，还要使用如下代码动态获取
          */
@@ -87,6 +107,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                 }
             }
         }
+
     }
 
     @Override
@@ -97,7 +118,11 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                 if (image != null){
                     image.setImageDrawable(null);
                 }
-                getDate();
+                cancelCall();
+//                getDateByOffline();
+//                getDateByCache();
+//                getCache();
+//                getDate();
 //                getAsynFile();
 //                postAsynFile();
 //                postAsynHttp();
@@ -129,30 +154,6 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
         }.start();
 
     }
-
-//    /**
-//     * 使用post请求网络数据
-//     */
-//    private void getDateFromPost() {
-//        new Thread(){
-//            @Override
-//            public void run() {
-//                super.run();
-//                try {
-//                    String result = post("http://api.m.mtime.cn/PageSubArea/TrailerList.api", "");
-//                    Log.e("TAG", result);
-//                    Message msg = Message.obtain();
-//                    msg.what = POST;
-//                    msg.obj = result;
-//                    handler.sendMessage(msg);
-//                } catch (IOException e) {
-//                    e.printStackTrace();
-//                }
-//            }
-//        }.start();
-//
-//    }
-
 
     /**
      * 异步GET请求
@@ -305,6 +306,275 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                 showLog(errorMsg);
             }
         });
+    }
+
+    /**
+     * 支持缓存的get请求，只有仅仅使用缓存或网络
+     */
+    private void getCache(){
+
+        /**
+         * 初始化缓存
+         */
+        File sdcache = getExternalCacheDir();
+        int cacheSize = 10 * 1024 * 1024;
+        cache = new Cache(sdcache.getAbsoluteFile(), cacheSize);
+
+        OkHttpClient okHttpClient = new OkHttpClient();
+        OkHttpClient mOkHttpClient = okHttpClient.newBuilder()
+                .addNetworkInterceptor(new CacheInterceptor())
+                .cache(cache)
+                .connectTimeout(20, TimeUnit.SECONDS)
+                .readTimeout(20, TimeUnit.SECONDS)
+                .build();
+        /**
+         * CacheControl.FORCE_CACHE; //仅仅使用缓存
+         * CacheControl.FORCE_NETWORK;//仅仅使用网络
+         */
+        Request request = new Request.Builder()
+                .url("http://www.baidu.com")
+                .build();
+//        final Request request = new Request.Builder()
+//                .url("http://www.baidu.com")
+//                .cacheControl(CacheControl.FORCE_NETWORK)
+//                .build();
+        Call call = mOkHttpClient.newCall(request);
+        call.enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {}
+
+            @Override
+            public void onResponse(Call call, final Response response) throws IOException {
+                if (null != response.cacheResponse()) {
+                    String str = response.cacheResponse().toString();
+                    showLog("cache--->" + str);
+                } else {
+                    response.body().string();
+                    String str=response.networkResponse().toString();
+                    showLog("network--->" + str);
+                }
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        Toast.makeText(getApplicationContext(), "请求成功", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            }
+        });
+    }
+
+    /**
+     * 第一种类型（有网和没有网都是先读缓存）
+     * 如果cache没有过期会直接返回cache而不会发起网络请求，若过期会自动发起网络请求。
+     */
+    private void getDateByCache(){
+        /**
+         * 初始化缓存
+         */
+        File sdcache = getExternalCacheDir();
+        int cacheSize = 10 * 1024 * 1024;
+        cache = new Cache(sdcache.getAbsoluteFile(), cacheSize);
+
+        /**创建拦截器**/
+        Interceptor interceptor = new Interceptor() {
+            @Override
+            public Response intercept(Chain chain) throws IOException {
+                Request request = chain.request();
+                Response response = chain.proceed(request);
+                String cacheControl = request.cacheControl().toString();
+                if (TextUtils.isEmpty(cacheControl)) {
+                    cacheControl = "public, max-age=60";
+                }
+                return response.newBuilder()
+                        .header("Cache-Control", cacheControl)
+                        .removeHeader("Pragma")
+                        .build();
+            }
+        };
+
+        /**创建OkHttpClient，并添加拦截器和缓存代码**/
+        OkHttpClient client = new OkHttpClient.Builder()
+                .addNetworkInterceptor(interceptor)
+                .cache(cache).build();
+
+        Request request = new Request.Builder()
+                .url("http://www.baidu.com")
+                .build();
+
+        Call call = client.newCall(request);
+        call.enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {}
+
+            @Override
+            public void onResponse(Call call, final Response response) throws IOException {
+                if (null != response.cacheResponse()) {
+                    String str = response.cacheResponse().toString();
+                    showLog("cache--->" + str);
+                } else {
+                    response.body().string();
+                    String str=response.networkResponse().toString();
+                    showLog("network--->" + str);
+                }
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        Toast.makeText(getApplicationContext(), "请求成功", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            }
+        });
+
+    }
+
+    /**
+     * 第二种类型（离线可以缓存，在线就获取最新数据）
+     */
+    private void getDateByOffline(){
+        /**
+         * 初始化缓存
+         */
+        File sdcache = getExternalCacheDir();
+        int cacheSize = 10 * 1024 * 1024;
+        cache = new Cache(sdcache.getAbsoluteFile(), cacheSize);
+
+        /**
+         * 有网时候的缓存
+         */
+        final Interceptor NetCacheInterceptor = new Interceptor() {
+            @Override
+            public Response intercept(Chain chain) throws IOException {
+                Request request = chain.request();
+                Response response = chain.proceed(request);
+                int onlineCacheTime = 0;//在线的时候的缓存过期时间，如果想要不缓存，直接时间设置为0
+                return response.newBuilder()
+                        .header("Cache-Control", "public, max-age="+onlineCacheTime)
+                        .removeHeader("Pragma")
+                        .build();
+            }
+        };
+        /**
+         * 没有网时候的缓存
+         */
+        final Interceptor OfflineCacheInterceptor = new Interceptor() {
+            @Override
+            public Response intercept(Chain chain) throws IOException {
+                Request request = chain.request();
+                if (!isNetworkAvailable(MainActivity.this)) {
+                    int offlineCacheTime = 60;//离线的时候的缓存的过期时间
+                    request = request.newBuilder()
+//                        .cacheControl(new CacheControl
+//                                .Builder()
+//                                .maxStale(60,TimeUnit.SECONDS)
+//                                .onlyIfCached()
+//                                .build()
+//                        ) 两种方式结果是一样的，写法不同
+                            .header("Cache-Control", "public, only-if-cached, max-stale=" + offlineCacheTime)
+                            .build();
+                }
+                return chain.proceed(request);
+            }
+        };
+
+        /**创建OkHttpClient，并添加拦截器和缓存代码**/
+        OkHttpClient client = new OkHttpClient.Builder()
+                .addNetworkInterceptor(NetCacheInterceptor)
+                .addInterceptor(OfflineCacheInterceptor)
+                .cache(cache)
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS)
+                .build();
+
+        final Request request = new Request.Builder()
+                .url("http://www.baidu.com")
+                .build();
+
+        Call call = client.newCall(request);
+        call.enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {}
+
+            @Override
+            public void onResponse(Call call, final Response response) throws IOException {
+                if (null != response.cacheResponse()) {
+                    String str = response.cacheResponse().toString();
+                    showLog("cache--->" + str);
+                } else {
+                    response.body().string();
+                    String str=response.networkResponse().toString();
+                    showLog("network--->" + str);
+                }
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        Toast.makeText(getApplicationContext(), "请求成功", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            }
+        });
+
+    }
+
+    /**
+     * 取消call
+     * 使用Call.cancel()可以节约网络资源，另外不管同步还是异步的call都可以取消。 
+     */
+    private  void cancelCall(){
+        OkHttpClient mOkHttpClient = new OkHttpClient();
+        Request request = new Request.Builder()
+                .url("http://www.baidu.com")
+                .cacheControl(CacheControl.FORCE_NETWORK)
+                .build();
+        Call call = null;
+        call = mOkHttpClient.newCall(request);
+        final Call finalCall = call;
+        //100毫秒后取消call
+        executor.schedule(new Runnable() {
+            @Override
+            public void run() {
+                finalCall.cancel();
+            }
+        }, 1, TimeUnit.MILLISECONDS);
+
+        call.enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {}
+
+            @Override
+            public void onResponse(Call call,final Response response) {
+                if (null != response.cacheResponse()) {
+                    String str = response.cacheResponse().toString();
+                    showLog("cache--->" + str);
+                } else {
+                    try {
+                        response.body().string();
+                    } catch (IOException e) {
+                        showLog("IOException");
+                        e.printStackTrace();
+                    }
+                    String str = response.networkResponse().toString();
+                    showLog("network--->" + str);
+                }
+            }
+        });
+        showLog("是否取消成功"+call.isCanceled());
+    }
+
+    /**
+     * 判断网络是否连接
+     * @param context
+     * @return
+     */
+    public static boolean isNetworkAvailable(Context context) {
+        if (context != null) {
+            ConnectivityManager mConnectivityManager = (ConnectivityManager) context
+                    .getSystemService(Context.CONNECTIVITY_SERVICE);
+            NetworkInfo mNetworkInfo = mConnectivityManager.getActiveNetworkInfo();
+            if (mNetworkInfo != null) {
+                return mNetworkInfo.isAvailable();
+            }
+        }
+        return false;
     }
 
     private void showLog(String message) {
